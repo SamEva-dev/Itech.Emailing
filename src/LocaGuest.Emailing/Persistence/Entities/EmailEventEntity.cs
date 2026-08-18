@@ -1,7 +1,7 @@
 using System;
 using System.ComponentModel.DataAnnotations.Schema;
 
-namespace LocaGuest.Emailing.Persistence.Entities;
+namespace Itech.Emailing.Persistence.Entities;
 
 public sealed class EmailEventEntity
 {

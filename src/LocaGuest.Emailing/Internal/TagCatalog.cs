@@ -1,8 +1,8 @@
 using System.Collections.Generic;
 using System.Linq;
-using LocaGuest.Emailing.Abstractions;
+using Itech.Emailing.Abstractions;
 
-namespace LocaGuest.Emailing.Internal;
+namespace Itech.Emailing.Internal;
 
 internal static class TagCatalog
 {

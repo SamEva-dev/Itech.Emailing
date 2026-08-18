@@ -1,8 +1,8 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Version 17
-VisualStudioVersion = 17.0.31903.59
+# Visual Studio Version 18
+VisualStudioVersion = 18.8.11912.234 insiders
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LocaGuest.Emailing", "src\LocaGuest.Emailing\LocaGuest.Emailing.csproj", "{8A0F61EF-4A42-4C0A-9F76-7F531D3BA1F5}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Itech.Emailing", "src\LocaGuest.Emailing\Itech.Emailing.csproj", "{8A0F61EF-4A42-4C0A-9F76-7F531D3BA1F5}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -14,5 +14,8 @@ Global
 		{8A0F61EF-4A42-4C0A-9F76-7F531D3BA1F5}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{8A0F61EF-4A42-4C0A-9F76-7F531D3BA1F5}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{8A0F61EF-4A42-4C0A-9F76-7F531D3BA1F5}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
 	EndGlobalSection
 EndGlobal

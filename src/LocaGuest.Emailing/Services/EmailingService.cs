@@ -2,16 +2,16 @@ using System;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using LocaGuest.Emailing.Abstractions;
-using LocaGuest.Emailing.Internal;
-using LocaGuest.Emailing.Options;
-using LocaGuest.Emailing.Persistence;
-using LocaGuest.Emailing.Persistence.Entities;
+using Itech.Emailing.Abstractions;
+using Itech.Emailing.Internal;
+using Itech.Emailing.Options;
+using Itech.Emailing.Persistence;
+using Itech.Emailing.Persistence.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
-namespace LocaGuest.Emailing.Services;
+namespace Itech.Emailing.Services;
 
 internal sealed class EmailingService : IEmailingService
 {

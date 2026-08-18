@@ -1,4 +1,4 @@
-namespace LocaGuest.Emailing.Options;
+namespace Itech.Emailing.Options;
 
 /// <summary>
 /// Binds to configuration section "Brevo".

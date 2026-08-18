@@ -1,4 +1,4 @@
-namespace LocaGuest.Emailing.Abstractions;
+namespace Itech.Emailing.Abstractions;
 
 public enum EmailStatus
 {

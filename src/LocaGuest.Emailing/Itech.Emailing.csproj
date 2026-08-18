@@ -7,7 +7,7 @@
 
     <!-- NuGet packaging -->
     <IsPackable>true</IsPackable>
-    <PackageId>LocaGuest.Emailing</PackageId>
+    <PackageId>Itech.Emailing</PackageId>
     <Version>1.0.5</Version>
     <Authors>LocaGuest</Authors>
     <Company>LocaGuest</Company>

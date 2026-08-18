@@ -2,14 +2,14 @@ using System;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
-using LocaGuest.Emailing.Options;
-using LocaGuest.Emailing.Providers.Models;
+using Itech.Emailing.Options;
+using Itech.Emailing.Providers.Models;
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using MimeKit;
 using Microsoft.Extensions.Logging;
 
-namespace LocaGuest.Emailing.Providers;
+namespace Itech.Emailing.Providers;
 
 internal sealed class SmtpEmailProvider : IEmailProvider
 {

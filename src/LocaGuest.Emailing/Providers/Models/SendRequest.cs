@@ -1,6 +1,6 @@
 using System.Collections.Generic;
 
-namespace LocaGuest.Emailing.Providers.Models;
+namespace Itech.Emailing.Providers.Models;
 
 internal sealed class SendRequest
 {
