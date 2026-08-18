@@ -1,0 +1,65 @@
+name: Publish NuGet
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  PACKAGE_VERSION: "2.0.0"
+  PROJECT_PATH: "src/Itech.Emailing/Itech.Emailing.csproj"
+  NUGET_SOURCE: "https://api.nuget.org/v3/index.json"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Restore
+        run: dotnet restore "${{ env.PROJECT_PATH }}"
+
+      - name: Build
+        run: dotnet build "${{ env.PROJECT_PATH }}" -c Release --no-restore
+
+      - name: Pack
+        run: >-
+          dotnet pack "${{ env.PROJECT_PATH }}"
+          -c Release
+          --no-build
+          -o ./artifacts
+          /p:PackageVersion=${{ env.PACKAGE_VERSION }}
+          /p:Version=${{ env.PACKAGE_VERSION }}
+
+      - name: NuGet login (Trusted Publishing)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: samEva-Dev
+
+      - name: Push to NuGet.org
+        run: >-
+          dotnet nuget push "./artifacts/*.nupkg"
+          --api-key "${{ steps.login.outputs.NUGET_API_KEY }}"
+          --source "${{ env.NUGET_SOURCE }}"
+          --skip-duplicate
+
+      - name: Upload NuGet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Itech.Emailing-${{ env.PACKAGE_VERSION }}
+          path: ./artifacts/*.nupkg
+          if-no-files-found: error

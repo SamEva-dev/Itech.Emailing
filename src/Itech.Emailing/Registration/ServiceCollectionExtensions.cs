@@ -16,7 +16,7 @@ public static class ServiceCollectionExtensions
     /// Register Itech.Emailing services + EF Core DbContext.
     /// The host can choose the database provider via the builder callback (recommended).
     /// </summary>
-    public static IServiceCollection AddLocaGuestEmailing(
+    public static IServiceCollection AddItechEmailing(
         this IServiceCollection services,
         IConfiguration configuration,
         Action<EmailingDbContextBuilder> db)

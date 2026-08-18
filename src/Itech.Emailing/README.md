@@ -73,7 +73,7 @@ environment:
 ## Register services (Program.cs)
 
 ```csharp
-builder.Services.AddLocaGuestEmailing(builder.Configuration, opt =>
+builder.Services.AddItechEmailing(builder.Configuration, opt =>
 {
     opt.UsePostgres(builder.Configuration.GetConnectionString("Default")!);
 });
