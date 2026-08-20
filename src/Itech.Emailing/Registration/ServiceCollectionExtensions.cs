@@ -38,6 +38,14 @@ public static class ServiceCollectionExtensions
 
         return services;
     }
+
+    [Obsolete("Use AddItechEmailing instead.")]
+    public static IServiceCollection AddLocaGuestEmailing(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        Action<EmailingDbContextBuilder> db) =>
+        services.AddItechEmailing(configuration, db);
+
 }
 
 public sealed class EmailingDbContextBuilder

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  PACKAGE_VERSION: "2.0.0"
+  PACKAGE_VERSION: "2.0.1"
   PROJECT_PATH: "src/Itech.Emailing/Itech.Emailing.csproj"
   NUGET_SOURCE: "https://api.nuget.org/v3/index.json"
 
