@@ -63,16 +63,26 @@ public sealed class EmailDispatcherWorker : BackgroundService
 
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailingDbContext>();
+        if (db.Database.ProviderName != "Npgsql.EntityFrameworkCore.PostgreSQL")
+            throw new InvalidOperationException("The production email dispatcher requires PostgreSQL for distributed ownership.");
+        await db.Database.OpenConnectionAsync(ct);
+        await using var claim=db.Database.GetDbConnection().CreateCommand();
+        claim.CommandText="SELECT pg_try_advisory_lock(9130911)";
+        if(!Convert.ToBoolean(await claim.ExecuteScalarAsync(ct))){await db.Database.CloseConnectionAsync();return;}
+        try {
         var brevo = scope.ServiceProvider.GetRequiredService<IOptions<BrevoOptions>>().Value;
         providerMode = brevo.Mode;
 
         var now = DateTime.UtcNow;
         var lockUntil = now.AddMinutes(_workerOptions.Value.LockMinutes);
 
-        var batch = await db.EmailMessages
+        await db.EmailMessages.Where(x=>x.Status==EmailStatus.Sending&&x.AttemptCount>=brevo.MaxRetries&&(x.LockedUntilUtc==null||x.LockedUntilUtc<now))
+            .ExecuteUpdateAsync(set=>set.SetProperty(x=>x.Status,EmailStatus.Failed).SetProperty(x=>x.NextAttemptAtUtc,(DateTime?)null).SetProperty(x=>x.LockedUntilUtc,(DateTime?)null).SetProperty(x=>x.LastError,"delivery_confirmation_required"),ct);
+        var batch = await db.EmailMessages.AsTracking()
             .Include(x => x.Attachments)
             .Where(x =>
-                (x.Status == EmailStatus.Queued || x.Status == EmailStatus.Failed) && // Failed here = retry-scheduled by NextAttemptAtUtc
+                (x.Status == EmailStatus.Queued || (x.Status == EmailStatus.Failed && x.NextAttemptAtUtc != null) || x.Status == EmailStatus.Sending) &&
+                x.AttemptCount < brevo.MaxRetries &&
                 (x.NextAttemptAtUtc == null || x.NextAttemptAtUtc <= now) &&
                 (x.LockedUntilUtc == null || x.LockedUntilUtc < now))
             .OrderBy(x => x.CreatedAtUtc)
@@ -103,10 +113,8 @@ public sealed class EmailDispatcherWorker : BackgroundService
             string? error = null;
 
             _logger.LogInformation(
-                "EmailDispatcher.ProcessMessage ENTER emailId={EmailId} to={ToEmail} templateId={TemplateId} attempt={Attempt} attachments={AttachmentsCount}",
+                "EmailDispatcher.ProcessMessage ENTER emailId={EmailId} attempt={Attempt} attachments={AttachmentsCount}",
                 msg.Id,
-                msg.ToEmail,
-                msg.TemplateId,
                 msg.AttemptCount,
                 msg.Attachments.Count);
 
@@ -139,8 +147,11 @@ public sealed class EmailDispatcherWorker : BackgroundService
                 };
 
                 msg.AttemptCount++;
+                await db.SaveChangesAsync(ct);
+                using var sendTimeout=CancellationTokenSource.CreateLinkedTokenSource(ct);
+                sendTimeout.CancelAfter(TimeSpan.FromSeconds(45));
 
-                var result = await provider.SendAsync(req, ct);
+                var result = await provider.SendAsync(req, sendTimeout.Token);
 
                 success = result.Success;
                 retryable = result.Retryable;
@@ -181,13 +192,13 @@ public sealed class EmailDispatcherWorker : BackgroundService
             {
                 msg.Status = EmailStatus.Failed;
                 msg.LockedUntilUtc = null;
-                msg.LastError = ex.Message;
-                msg.NextAttemptAtUtc = DateTime.UtcNow.AddMinutes(5);
+                msg.LastError = "provider_request_failed";
+                msg.NextAttemptAtUtc = msg.AttemptCount >= brevo.MaxRetries ? null : DateTime.UtcNow.AddMinutes(5);
                 await db.SaveChangesAsync(ct);
 
                 success = false;
                 retryable = true;
-                error = ex.Message;
+                error = "provider_request_failed";
 
                 _logger.LogWarning(ex, "Email dispatch failed for {EmailId}", msg.Id);
             }
@@ -210,6 +221,13 @@ public sealed class EmailDispatcherWorker : BackgroundService
             batchCount,
             providerMode,
             (long)(DateTime.UtcNow - startedAt).TotalMilliseconds);
+        }
+        finally {
+            await using var release=db.Database.GetDbConnection().CreateCommand();
+            release.CommandText="SELECT pg_advisory_unlock(9130911)";
+            await release.ExecuteScalarAsync(CancellationToken.None);
+            await db.Database.CloseConnectionAsync();
+        }
     }
 
     private static IEmailProvider CreateProvider(IServiceProvider sp, BrevoOptions brevo)
