@@ -18,230 +18,188 @@ using Microsoft.Extensions.Options;
 namespace Itech.Emailing.Workers;
 
 /// <summary>
-/// Background worker that dispatches queued emails using configured Brevo provider (API or SMTP).
+/// PostgreSQL multi-instance dispatcher with atomic SKIP LOCKED claims and fencing tokens.
+/// Ambiguous sends are quarantined, not retried automatically. This does not provide
+/// exactly-once delivery at the external email provider.
 /// </summary>
 public sealed class EmailDispatcherWorker : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<EmailDispatcherWorker> _logger;
-    private readonly IOptions<EmailDispatcherOptions> _workerOptions;
+    private readonly IOptions<EmailDispatcherOptions> _options;
 
-    public EmailDispatcherWorker(
-        IServiceScopeFactory scopeFactory,
-        ILogger<EmailDispatcherWorker> logger,
-        IOptions<EmailDispatcherOptions> workerOptions)
+    public EmailDispatcherWorker(IServiceScopeFactory scopeFactory,
+        ILogger<EmailDispatcherWorker> logger, IOptions<EmailDispatcherOptions> options)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
-        _workerOptions = workerOptions;
+        _options = options;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            try
-            {
-                await DispatchBatch(stoppingToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Email dispatcher crashed");
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(_workerOptions.Value.PollSeconds), stoppingToken);
+            try { await DispatchBatch(stoppingToken); }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
+            catch (Exception ex) { _logger.LogError(ex, "Email dispatcher batch failed"); }
+            await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _options.Value.PollSeconds)), stoppingToken);
         }
     }
 
     private async Task DispatchBatch(CancellationToken ct)
     {
-        var startedAt = DateTime.UtcNow;
-        int? batchCount = null;
-        string? providerMode = null;
-
-        _logger.LogInformation("EmailDispatcher.DispatchBatch ENTER");
-
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailingDbContext>();
         if (db.Database.ProviderName != "Npgsql.EntityFrameworkCore.PostgreSQL")
-            throw new InvalidOperationException("The production email dispatcher requires PostgreSQL for distributed ownership.");
-        await db.Database.OpenConnectionAsync(ct);
-        await using var claim=db.Database.GetDbConnection().CreateCommand();
-        claim.CommandText="SELECT pg_try_advisory_lock(9130911)";
-        if(!Convert.ToBoolean(await claim.ExecuteScalarAsync(ct))){await db.Database.CloseConnectionAsync();return;}
-        try {
+            throw new InvalidOperationException("S20 requires PostgreSQL for atomic email dispatch claims.");
+
         var brevo = scope.ServiceProvider.GetRequiredService<IOptions<BrevoOptions>>().Value;
-        providerMode = brevo.Mode;
-
         var now = DateTime.UtcNow;
-        var lockUntil = now.AddMinutes(_workerOptions.Value.LockMinutes);
+        var batchSize = Math.Clamp(_options.Value.BatchSize, 1, 100);
 
-        await db.EmailMessages.Where(x=>x.Status==EmailStatus.Sending&&x.AttemptCount>=brevo.MaxRetries&&(x.LockedUntilUtc==null||x.LockedUntilUtc<now))
-            .ExecuteUpdateAsync(set=>set.SetProperty(x=>x.Status,EmailStatus.Failed).SetProperty(x=>x.NextAttemptAtUtc,(DateTime?)null).SetProperty(x=>x.LockedUntilUtc,(DateTime?)null).SetProperty(x=>x.LastError,"delivery_confirmation_required"),ct);
-        var batch = await db.EmailMessages.AsTracking()
-            .Include(x => x.Attachments)
-            .Where(x =>
-                (x.Status == EmailStatus.Queued || (x.Status == EmailStatus.Failed && x.NextAttemptAtUtc != null) || x.Status == EmailStatus.Sending) &&
-                x.AttemptCount < brevo.MaxRetries &&
-                (x.NextAttemptAtUtc == null || x.NextAttemptAtUtc <= now) &&
-                (x.LockedUntilUtc == null || x.LockedUntilUtc < now))
-            .OrderBy(x => x.CreatedAtUtc)
-            .Take(_workerOptions.Value.BatchSize)
-            .ToListAsync(ct);
+        // A previous worker may have crashed AFTER the provider accepted a message.
+        // Never automatically resend a timed-out Sending row: operator/provider
+        // reconciliation is required to avoid a duplicate signature email.
+        var quarantined = await db.Database.ExecuteSqlInterpolatedAsync($"""
+            UPDATE emailing."EmailMessages"
+            SET "Status" = {(int)EmailStatus.Deferred},
+                "NextAttemptAtUtc" = NULL,
+                "LockedUntilUtc" = NULL,
+                "DispatchLeaseId" = NULL,
+                "LastError" = 'EMAIL_DELIVERY_OUTCOME_UNKNOWN'
+            WHERE "Status" = {(int)EmailStatus.Sending}
+              AND "LockedUntilUtc" < {now}
+            """, ct);
+        if (quarantined > 0)
+            _logger.LogWarning("Quarantined {Count} emails whose sending lease expired; reconcile with provider", quarantined);
 
-        batchCount = batch.Count;
+        // Messages scheduled by older worker versions have unknown retry semantics.
+        // Preserve only 429 (explicit provider rejection); quarantine ambiguous retries.
+        var legacy = await db.Database.ExecuteSqlInterpolatedAsync($"""
+            UPDATE emailing."EmailMessages"
+            SET "Status" = {(int)EmailStatus.Deferred},
+                "NextAttemptAtUtc" = NULL,
+                "LastError" = 'EMAIL_LEGACY_RETRY_REQUIRES_RECONCILIATION'
+            WHERE "Status" = {(int)EmailStatus.Failed}
+              AND "NextAttemptAtUtc" IS NOT NULL
+              AND ("LastError" IS NULL OR "LastError" NOT LIKE 'Brevo API error 429:%')
+            """, ct);
+        if (legacy > 0)
+            _logger.LogWarning("Quarantined {Count} legacy retrying emails for reconciliation", legacy);
 
-        if (batch.Count == 0) return;
-
-        // Select provider
+        // Claim only ONE email at a time, immediately before sending it. Claiming
+        // a whole batch would let the lease expire before later emails are sent.
         var provider = CreateProvider(scope.ServiceProvider, brevo);
-
-        // Lock
-        foreach (var msg in batch)
+        for (var position = 0; position < batchSize; position++)
         {
-            msg.Status = EmailStatus.Sending;
-            msg.LockedUntilUtc = lockUntil;
-        }
-        await db.SaveChangesAsync(ct);
+            var lease = Guid.NewGuid();
+            var claimedAt = DateTime.UtcNow;
+            var lockUntil = claimedAt.AddMinutes(Math.Max(1, _options.Value.LockMinutes));
+            // PostgreSQL locks the selected row and skips concurrent claims.
+            await db.Database.ExecuteSqlInterpolatedAsync($"""
+            UPDATE emailing."EmailMessages" AS m
+            SET "Status" = {(int)EmailStatus.Sending},
+                "LockedUntilUtc" = {lockUntil},
+                "DispatchLeaseId" = {lease},
+                "AttemptCount" = m."AttemptCount" + 1
+            WHERE m."Id" IN (
+                SELECT e."Id" FROM emailing."EmailMessages" AS e
+                WHERE (e."Status" = {(int)EmailStatus.Queued}
+                       OR (e."Status" = {(int)EmailStatus.Failed}
+                           AND e."NextAttemptAtUtc" IS NOT NULL))
+                  AND (e."NextAttemptAtUtc" IS NULL OR e."NextAttemptAtUtc" <= {claimedAt})
+                  AND (e."LockedUntilUtc" IS NULL OR e."LockedUntilUtc" < {claimedAt})
+                ORDER BY e."CreatedAtUtc", e."Id"
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            """, ct);
 
-        foreach (var msg in batch)
-        {
-            var msgStartedAt = DateTime.UtcNow;
-            bool? success = null;
-            bool? retryable = null;
-            string? providerMessageId = null;
+            var msg = await db.EmailMessages.AsNoTracking()
+                .Include(x => x.Attachments)
+                .SingleOrDefaultAsync(x => x.DispatchLeaseId == lease && x.Status == EmailStatus.Sending, ct);
+            if (msg is null) break;
+
+            ct.ThrowIfCancellationRequested();
+            EmailStatus status;
+            string? providerId = null;
             string? error = null;
-
-            _logger.LogInformation(
-                "EmailDispatcher.ProcessMessage ENTER emailId={EmailId} attempt={Attempt} attachments={AttachmentsCount}",
-                msg.Id,
-                msg.AttemptCount,
-                msg.Attachments.Count);
-
+            DateTime? retryAt = null;
             try
             {
                 var contextTags = TagCatalog.ParseCsv(msg.ContextTagsCsv);
                 var useCaseTags = TagCatalog.ParseCsv(msg.UseCaseTagsCsv);
-                var allTags = contextTags.Concat(useCaseTags).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-
                 object? templateParams = null;
                 if (!string.IsNullOrWhiteSpace(msg.TemplateParamsJson))
                     templateParams = JsonSerializer.Deserialize<object>(msg.TemplateParamsJson);
-
-                var req = new SendRequest
+                var request = new SendRequest
                 {
-                    ToEmail = msg.ToEmail,
-                    ToName = msg.ToName,
-                    Subject = msg.Subject,
-                    HtmlContent = msg.HtmlContent,
-                    TextContent = msg.TextContent,
-                    TemplateId = msg.TemplateId,
+                    ToEmail = msg.ToEmail, ToName = msg.ToName,
+                    Subject = msg.Subject, HtmlContent = msg.HtmlContent,
+                    TextContent = msg.TextContent, TemplateId = msg.TemplateId,
                     TemplateParams = templateParams,
                     Attachments = msg.Attachments.Select(a => new SendAttachment
                     {
-                        FileName = a.FileName,
-                        ContentType = a.ContentType,
-                        Content = a.Content
+                        FileName = a.FileName, ContentType = a.ContentType, Content = a.Content
                     }).ToList(),
-                    Tags = allTags
+                    Tags = contextTags.Concat(useCaseTags)
+                        .Distinct(StringComparer.OrdinalIgnoreCase).ToList()
                 };
-
-                msg.AttemptCount++;
-                await db.SaveChangesAsync(ct);
-                using var sendTimeout=CancellationTokenSource.CreateLinkedTokenSource(ct);
-                sendTimeout.CancelAfter(TimeSpan.FromSeconds(45));
-
-                var result = await provider.SendAsync(req, sendTimeout.Token);
-
-                success = result.Success;
-                retryable = result.Retryable;
-                providerMessageId = result.ProviderMessageId;
+                var result = await provider.SendAsync(request, ct);
+                providerId = result.ProviderMessageId;
                 error = result.Error;
-
-                if (result.Success)
+                if (result.Success) status = EmailStatus.Sent;
+                else if (result.Retryable && result.Error?.StartsWith("Brevo API error 429:", StringComparison.Ordinal) == true
+                         && msg.AttemptCount < brevo.MaxRetries)
                 {
-                    msg.ProviderMessageId = result.ProviderMessageId;
-                    msg.Status = EmailStatus.Sent;
-                    msg.LockedUntilUtc = null;
-                    msg.NextAttemptAtUtc = null;
-                    msg.LastError = null;
-                    msg.LastEventAtUtc = DateTime.UtcNow;
+                    // 429 is an explicit rejection; it is safe to schedule another attempt.
+                    status = EmailStatus.Failed;
+                    retryAt = DateTime.UtcNow.Add(RetryPolicy.ComputeDelay(msg.AttemptCount));
                 }
+                else if (result.Retryable)
+                    status = EmailStatus.Deferred; // 5xx, timeout or SMTP ambiguity
                 else
-                {
-                    msg.LastError = result.Error;
-                    msg.LockedUntilUtc = null;
-
-                    if (!result.Retryable || msg.AttemptCount >= brevo.MaxRetries)
-                    {
-                        // Permanent failure
-                        msg.Status = EmailStatus.Failed;
-                        msg.NextAttemptAtUtc = null;
-                    }
-                    else
-                    {
-                        // Schedule retry (reuse Failed + NextAttemptAtUtc to avoid extra enum)
-                        msg.Status = EmailStatus.Failed;
-                        msg.NextAttemptAtUtc = DateTime.UtcNow.Add(RetryPolicy.ComputeDelay(msg.AttemptCount));
-                    }
-                }
-
-                await db.SaveChangesAsync(ct);
+                    status = EmailStatus.Failed;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Keep lease; next batch will quarantine it if the worker terminates.
+                throw;
             }
             catch (Exception ex)
             {
-                msg.Status = EmailStatus.Failed;
-                msg.LockedUntilUtc = null;
-                msg.LastError = "provider_request_failed";
-                msg.NextAttemptAtUtc = msg.AttemptCount >= brevo.MaxRetries ? null : DateTime.UtcNow.AddMinutes(5);
-                await db.SaveChangesAsync(ct);
-
-                success = false;
-                retryable = true;
-                error = "provider_request_failed";
-
-                _logger.LogWarning(ex, "Email dispatch failed for {EmailId}", msg.Id);
+                status = EmailStatus.Deferred;
+                error = "EMAIL_DELIVERY_OUTCOME_UNKNOWN";
+                _logger.LogError(ex, "Uncertain email provider outcome for {EmailId}", msg.Id);
             }
-            finally
-            {
-                var elapsedMs = (long)(DateTime.UtcNow - msgStartedAt).TotalMilliseconds;
-                _logger.LogInformation(
-                    "EmailDispatcher.ProcessMessage EXIT emailId={EmailId} success={Success} retryable={Retryable} providerMessageId={ProviderMessageId} error={Error} elapsedMs={ElapsedMs}",
-                    msg.Id,
-                    success,
-                    retryable,
-                    providerMessageId,
-                    error,
-                    elapsedMs);
-            }
-        }
 
-        _logger.LogInformation(
-            "EmailDispatcher.DispatchBatch EXIT batchCount={BatchCount} providerMode={ProviderMode} elapsedMs={ElapsedMs}",
-            batchCount,
-            providerMode,
-            (long)(DateTime.UtcNow - startedAt).TotalMilliseconds);
-        }
-        finally {
-            await using var release=db.Database.GetDbConnection().CreateCommand();
-            release.CommandText="SELECT pg_advisory_unlock(9130911)";
-            await release.ExecuteScalarAsync(CancellationToken.None);
-            await db.Database.CloseConnectionAsync();
+            // Fencing: a late provider response may not overwrite a row after the
+            // lease was revoked/quarantined by another worker.
+            var changed = await db.EmailMessages
+                .Where(x => x.Id == msg.Id && x.DispatchLeaseId == lease && x.Status == EmailStatus.Sending)
+                .ExecuteUpdateAsync(set => set
+                    .SetProperty(x => x.Status, status)
+                    .SetProperty(x => x.ProviderMessageId, providerId)
+                    .SetProperty(x => x.LastError, error)
+                    .SetProperty(x => x.NextAttemptAtUtc, retryAt)
+                    .SetProperty(x => x.LockedUntilUtc, (DateTime?)null)
+                    .SetProperty(x => x.DispatchLeaseId, (Guid?)null)
+                    .SetProperty(x => x.LastEventAtUtc,
+                        status == EmailStatus.Sent ? (DateTime?)DateTime.UtcNow : null), ct);
+            if (changed != 1)
+                _logger.LogError("Email dispatch lease lost for {EmailId}; reconcile provider result manually", msg.Id);
+            else if (status == EmailStatus.Deferred)
+                _logger.LogWarning("Email {EmailId} outcome uncertain; manual reconciliation required", msg.Id);
         }
     }
 
     private static IEmailProvider CreateProvider(IServiceProvider sp, BrevoOptions brevo)
     {
         if (string.Equals(brevo.Mode, "BREVO_SMTP", StringComparison.OrdinalIgnoreCase))
-        {
-            var logger = sp.GetRequiredService<ILogger<SmtpEmailProvider>>();
-            return new SmtpEmailProvider(brevo, logger);
-        }
-
-        // Default: API
-        var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
-        var http = httpClientFactory.CreateClient("BrevoApi");
-        var loggerApi = sp.GetRequiredService<ILogger<BrevoApiEmailProvider>>();
-        return new BrevoApiEmailProvider(http, brevo, loggerApi);
+            return new SmtpEmailProvider(brevo, sp.GetRequiredService<ILogger<SmtpEmailProvider>>());
+        var http = sp.GetRequiredService<IHttpClientFactory>().CreateClient("BrevoApi");
+        return new BrevoApiEmailProvider(http, brevo,
+            sp.GetRequiredService<ILogger<BrevoApiEmailProvider>>());
     }
 }

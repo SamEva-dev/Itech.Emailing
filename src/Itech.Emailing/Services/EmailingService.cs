@@ -13,7 +13,7 @@ using Microsoft.Extensions.Options;
 
 namespace Itech.Emailing.Services;
 
-internal sealed class EmailingService : IEmailingService
+internal sealed partial class EmailingService : IEmailingService, IIdempotentEmailingService
 {
     private readonly EmailingDbContext _db;
     private readonly BrevoOptions _brevo;

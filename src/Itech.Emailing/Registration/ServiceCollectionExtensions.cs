@@ -34,7 +34,9 @@ public static class ServiceCollectionExtensions
             c.BaseAddress = new Uri(opt.ApiBaseUrl);
         });
 
-        services.AddScoped<IEmailingService, EmailingService>();
+        services.AddScoped<EmailingService>();
+        services.AddScoped<IEmailingService>(sp => sp.GetRequiredService<EmailingService>());
+        services.AddScoped<IIdempotentEmailingService>(sp => sp.GetRequiredService<EmailingService>());
 
         return services;
     }

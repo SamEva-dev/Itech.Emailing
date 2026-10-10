@@ -9,6 +9,13 @@ public sealed class EmailMessageEntity
 
     public Guid? TenantId { get; set; }
 
+    // Stable business-event key, globally unique (include tenant in the caller's namespace).
+    public string? IdempotencyKey { get; set; }
+    public string? PayloadSha256 { get; set; }
+
+    // Fencing token assigned during an atomic PostgreSQL claim.
+    public Guid? DispatchLeaseId { get; set; }
+
     public string ToEmail { get; set; } = default!;
     public string? ToName { get; set; }
 

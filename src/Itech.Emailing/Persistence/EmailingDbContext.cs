@@ -16,6 +16,20 @@ public sealed class EmailingDbContext : DbContext
         modelBuilder.HasDefaultSchema("emailing");
 
         modelBuilder.Entity<EmailMessageEntity>()
+            .Property(x => x.IdempotencyKey).HasMaxLength(200);
+
+        modelBuilder.Entity<EmailMessageEntity>()
+            .Property(x => x.PayloadSha256).HasMaxLength(64);
+
+        modelBuilder.Entity<EmailMessageEntity>()
+            .HasIndex(x => x.IdempotencyKey)
+            .IsUnique()
+            .HasFilter("\"IdempotencyKey\" IS NOT NULL");
+
+        modelBuilder.Entity<EmailMessageEntity>()
+            .HasIndex(x => x.DispatchLeaseId);
+
+        modelBuilder.Entity<EmailMessageEntity>()
             .HasIndex(x => x.ProviderMessageId);
 
         modelBuilder.Entity<EmailMessageEntity>()
